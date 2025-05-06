@@ -1,4 +1,4 @@
-name: Deploy Cloudflare Worker with D1
+name: Deploy Cloudflare Worker with D1 and KV
 
 on:
   workflow_dispatch:
