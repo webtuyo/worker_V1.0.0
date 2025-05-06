@@ -1,0 +1,210 @@
+name: Deploy Cloudflare Worker with D1
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Load .env variables
+        id: load-env
+        run: |
+          if [ -f .env ]; then
+            echo "Loading .env variables..."
+            grep -v '^#' .env | grep -v '^[[:space:]]*$' | while IFS= read -r line; do
+              # Ensure variables are exported for subsequent steps using $VAR syntax
+              echo "$line" >> $GITHUB_ENV
+            done
+            echo "Variables loaded from .env:"
+            # Print loaded env vars for debugging (optional)
+            grep -v '^#' .env | grep -v '^[[:space:]]*$'
+          else
+            echo "Error: .env file not found!"
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '22' 
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Specific Wrangler Version
+        # Installing globally can sometimes cause issues; consider npx or local install
+        # Using npx wrangler@<version> in each command is often safer
+        run: npm install -g wrangler@4.14.1 # Pinning the version is good
+
+      - name: Check Wrangler Version
+        run: wrangler --version
+
+      # --- STEP 1: Substitute STATIC names first ---
+      # This ensures wrangler create commands use the correct names if needed
+      # Although wrangler create uses args here, it's good practice if other
+      # commands read the file before IDs are known.
+      - name: Substitute static names in wrangler.toml
+        run: |
+          echo "Substituting static names in wrangler.toml..."
+          # Use a different delimiter for sed in case names have slashes
+          sed -i "s|\${WORKER_NAME}|${{ env.WORKER_NAME }}|g" wrangler.toml
+          sed -i "s|\${DB_NAME}|${{ env.WORKER_NAME }}-DB|g" wrangler.toml
+          sed -i "s|\${YOUR_DOMAIN}|"https://design.webtuyo.com","https://edit.webtuyo.com","https://preview.webtuyo.com", |g" wrangler.toml
+          echo "wrangler.toml after static substitution:"
+          cat wrangler.toml
+
+      # --- STEP 2: Create D1 Database ---
+      - name: Create D1 Database
+        # Use npx to ensure correct wrangler version is used
+        run: npx wrangler@4.14.1 d1 create ${{ env.WORKER_NAME }}-DB || echo "D1 DB ${{ env.WORKER_NAME }}-DB likely already exists."
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      # --- STEP 3: Get D1 Database ID ---
+      - name: Get and Extract Database ID
+        id: extract-db
+        run: |
+          echo "Fetching D1 Databases..."
+          # Use npx and capture output reliably
+          WRANGLER_OUTPUT=$(npx wrangler@4.14.1 d1 list --json)
+          echo "Wrangler D1 list output (raw): $WRANGLER_OUTPUT" # Log raw output
+
+          # Error handling for jq failure or empty output
+          if ! echo "$WRANGLER_OUTPUT" | jq .; then
+             echo "❌ Failed to parse D1 list JSON output."
+             exit 1
+          fi
+          if [ -z "$WRANGLER_OUTPUT" ] || [ "$WRANGLER_OUTPUT" == "[]" ]; then
+             echo "❌ No D1 databases found or empty output."
+             exit 1
+          fi
+
+          DB_ID=$(echo "$WRANGLER_OUTPUT" \
+            | jq -r --arg DBNAME "${{ env.WORKER_NAME }}-DB" \
+              '.[] | select(.name == $DBNAME) | .uuid')
+
+          if [ -z "$DB_ID" ] || [ "$DB_ID" == "null" ]; then
+            echo "❌ Failed to extract database ID for name '${{ env.WORKER_NAME }}-DB'"
+            echo "Available databases (parsed):"
+            echo "$WRANGLER_OUTPUT" | jq .
+            exit 1
+          fi
+
+          echo "DATABASE_ID=$DB_ID" >> $GITHUB_ENV
+          echo "✅ Extracted Database ID: $DB_ID"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      # --- STEP 4: Set KV Namespace Title ---
+      - name: Set KV Namespace Title
+        id: set-kv-title
+        run: |
+          KV_TITLE="${{ env.WORKER_NAME }}-KV" # Construct title from worker name
+          echo "KV_NAMESPACE_TITLE=$KV_TITLE" >> $GITHUB_ENV
+          echo "KV Namespace Title set to: $KV_TITLE"
+
+      # --- STEP 5: Create KV Namespace ---
+      - name: Create KV Namespace
+        # Use npx wrangler
+        run: npx wrangler@4.14.1 kv namespace create "${{ env.KV_NAMESPACE_TITLE }}" || echo "KV Namespace ${{ env.KV_NAMESPACE_TITLE }} likely already exists."
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      # --- STEP 6: Get KV Namespace ID ---
+      - name: Get and Extract KV Namespace ID
+        id: extract-kv
+        run: |
+          echo "Fetching KV Namespaces..."
+          # Use npx wrangler, handle potential JSON issues
+          WRANGLER_OUTPUT=$(npx wrangler@4.14.1 kv namespace list) 
+          echo "Wrangler KV list output (raw): $WRANGLER_OUTPUT" # Log raw output
+
+          # Basic check if output looks like JSON array
+          if ! echo "$WRANGLER_OUTPUT" | jq .; then
+             echo "⚠️ Failed to parse KV list JSON output. Trying text parsing."
+             # Fallback: If --json is not supported or fails, parse text output (less reliable)
+             WRANGLER_OUTPUT_TEXT=$(npx wrangler@4.14.1 kv namespace list)
+             echo "Wrangler KV list output (text): $WRANGLER_OUTPUT_TEXT"
+             KV_ID=$(echo "$WRANGLER_OUTPUT_TEXT" | grep "${{ env.KV_NAMESPACE_TITLE }}" | awk '{print $NF}') # Assumes ID is last field
+          else
+             # Proceed with jq parsing
+             if [ -z "$WRANGLER_OUTPUT" ] || [ "$WRANGLER_OUTPUT" == "[]" ]; then
+                echo "❌ No KV namespaces found or empty output."
+                exit 1
+             fi
+             KV_ID=$(
+               echo "$WRANGLER_OUTPUT" |
+               jq -r --arg TITLE "${{ env.KV_NAMESPACE_TITLE }}" \
+                 '.[] | select(.title == $TITLE) | .id'
+             )
+          fi
+
+
+          if [ -z "$KV_ID" ] || [ "$KV_ID" == "null" ]; then
+            echo "❌ Failed to extract KV namespace ID for title '${{ env.KV_NAMESPACE_TITLE }}'"
+            echo "Available KV namespaces (parsed, if JSON worked):"
+            echo "$WRANGLER_OUTPUT" | jq . # Might be empty/invalid if JSON failed
+            exit 1
+          fi
+
+          echo "KV_NAMESPACE_ID=$KV_ID" >> $GITHUB_ENV
+          echo "✅ Found KV ID: $KV_ID"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      # --- STEP 7: Substitute DYNAMIC IDs ---
+      # Now that IDs are known, substitute them into the wrangler.toml
+      - name: Substitute dynamic IDs in wrangler.toml
+        run: |
+          echo "Substituting dynamic IDs in wrangler.toml..."
+          # Check if IDs were actually set
+          if [ -z "${{ env.DATABASE_ID }}" ]; then echo "Error: DATABASE_ID is empty!"; exit 1; fi
+          if [ -z "${{ env.KV_NAMESPACE_ID }}" ]; then echo "Error: KV_NAMESPACE_ID is empty!"; exit 1; fi
+
+          # Use a different delimiter for sed in case IDs have special chars (unlikely for UUIDs)
+          sed -i "s|\${DATABASE_ID}|${{ env.DATABASE_ID }}|g" wrangler.toml
+          sed -i "s|\${KV_NAMESPACE_ID}|${{ env.KV_NAMESPACE_ID }}|g" wrangler.toml
+          echo "wrangler.toml after ALL substitutions:"
+          cat wrangler.toml # Verify the final file contents
+
+      # --- STEP 8: Initialize Database Schema ---
+      # Now wrangler.toml has the correct database_id for the binding
+      - name: Initialize Database Schema
+        # Use npx wrangler
+        run: npx wrangler@4.14.1 d1 execute ${{ env.WORKER_NAME }}-DB --file=./schema.sql --remote
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # DATABASE_ID is now read from the substituted wrangler.toml
+
+      # --- STEP 9: Set KV Pair ---
+      # This uses the ID directly, so it's fine
+      - name: Set KV Pair from JSON
+        run: |
+          if [ ! -f data.json ]; then echo "Error: data.json not found!"; exit 1; fi
+          echo "Putting data from data.json into KV namespace ${{ env.KV_NAMESPACE_ID }}"
+          # Use npx wrangler with the specific ID
+          npx wrangler@4.14.1 kv key put --namespace-id=${{ env.KV_NAMESPACE_ID }} "live" --path=./data.json --remote
+          echo "KV put command executed."
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      # --- STEP 10: Deploy Worker ---
+      # wrangler.toml is now fully substituted, deploy should work
+      - name: Deploy Worker
+        # Use npx wrangler
+        run: npx wrangler@4.14.1 deploy
+        env:
+          # Provide credentials for the deploy command itself
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
